@@ -1,0 +1,128 @@
+pipeline {
+   agent any
+
+   tools {
+      // Install the Maven version configured as "M3" and add it to the path.
+      maven "Maven"
+   }
+   options
+    {
+        // Append time stamp to the console output.
+        timestamps()
+
+        // Discard old builds after 10 days or 30 builds count.
+        buildDiscarder(logRotator(daysToKeepStr: '10', numToKeepStr: '10'))
+	  
+	    //To avoid concurrent builds to avoid multiple checkouts
+	    disableConcurrentBuilds()
+    }
+   stages {
+      stage('Git Pull')
+		{		
+			steps
+			{
+				script 
+				{
+					properties([pipelineTriggers([pollSCM('* * * * *')])])
+				}	
+				git  branch: 'dev',credentialsId: 'c1c0acc0-bf43-458c-abd1-8c21582da070', url: 'https://github.com/AshwaniNingania/nagp_war_test.git'
+			}
+		}
+		stage('Build') 
+			{
+				steps
+					{
+							bat "mvn clean install"
+						}
+					}
+			stage('Test')
+			{
+				steps
+					{
+						bat "mvn clean test" 
+					}
+			}
+			stage('Publish Test Results')
+			{
+				steps
+					{
+						junit allowEmptyResults: true, testResults: '/target/surefire-reports/*.xml'
+					}
+			}
+			stage('SonarQube Analysis') 
+			{
+				steps 
+					{
+						withSonarQubeEnv("sonarServer") 
+        				{
+        					bat "mvn sonar:sonar"
+        				}
+					}
+			}
+			stage ('Upload to Artifactory')
+			{
+				steps
+				{
+					rtMavenDeployer (
+						id: 'deployer',
+						serverId: 'ashwani01@artifactory',
+						releaseRepo: 'ashwani01_assignment',
+						snapshotRepo: 'ashwani01_assignment'
+					)
+					rtMavenRun (
+						pom: 'pom.xml',
+						goals: 'clean install',
+						deployerId: 'deployer',
+					)
+					rtPublishBuildInfo (
+						serverId: 'ashwani01@artifactory',
+					)
+				}
+			}
+			stage ('Docker Image')
+			{
+				steps
+				{
+					sh returnStdout: true, script: 'docker build -t dtr.nagarro.com:443/test_dev_branch:${BUILD_NUMBER} -f Dockerfile .'
+				}
+			}
+			stage ('Push to DTR')
+			{
+				steps
+				{
+					sh returnStdout: true, script: 'docker push dtr.nagarro.com:443/test_dev_branch:${BUILD_NUMBER}'
+				}
+			}
+			stage ('Stop Running container')
+			{
+				steps
+				{
+					sh '''
+						ContainerID=$(docker ps | grep 7017 | cut -d " " -f 1)
+						if [  $ContainerID ]
+						then
+							docker stop $ContainerID
+							docker rm -f $ContainerID
+						fi
+					'''
+				}
+			}
+	
+			stage ('Docker deployment')
+			{
+				steps
+				{
+					sh 'docker run --name test_dev_branch -d -p 7017:8080 dtr.nagarro.com:443/test_dev_branch:${BUILD_NUMBER}'
+				}
+			}
+			
+	}
+	post 
+	{
+        always 
+		{
+			 emailext body: '$PROJECT_NAME - Build # $BUILD_NUMBER - $BUILD_STATUS!', recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']], subject: '$PROJECT_NAME - Build # $BUILD_NUMBER - $BUILD_STATUS!',attachLog: true
+           
+        }
+    }
+}
